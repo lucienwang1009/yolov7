@@ -6,6 +6,7 @@ from threading import Thread
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
 
@@ -16,6 +17,7 @@ from utils.general import coco80_to_coco91_class, check_dataset, check_file, che
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
+from utils.fewshot.few_shot_generator import FewShotGenerator
 
 
 def test(data,
@@ -40,7 +42,9 @@ def test(data,
          half_precision=True,
          trace=False,
          is_coco=False,
-         v5_metric=False):
+         v5_metric=False,
+         few_shot=False,
+         shots=10):
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -56,9 +60,10 @@ def test(data,
 
         # Load model
         model = attempt_load(weights, map_location=device)  # load FP32 model
+        model.few_shot = few_shot
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
-        
+
         if trace:
             model = TracedModel(model, device, imgsz)
 
@@ -92,10 +97,34 @@ def test(data,
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
-    
+
+    # NOTE: few shot start
+    support_features = None
+    if few_shot:
+        few_shot_generator = FewShotGenerator(
+            dataloader.dataset.path, shots=shots
+        )
+        support_imgs, support_targets = \
+            few_shot_generator.generate(seed=0)
+        support_imgs = torch.stack(support_imgs, 0).to(
+            device, non_blocking=True
+        )
+        if half:
+            support_imgs = support_imgs.half()
+        else:
+            support_imgs = support_imgs.float() / 255
+        support_targets = torch.stack(support_targets, 0).to(device)
+
+        support_features = model.get_support_features(
+            support_imgs, support_targets
+        )
+    # few shot end
+
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
-    names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
+    names = ['item'] if single_cls and len(data['names']) != 1 else data['names']  # class names
+    names = {k: v for k, v in enumerate(names)}
+    # names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
@@ -111,12 +140,45 @@ def test(data,
         with torch.no_grad():
             # Run model
             t = time_synchronized()
-            out, train_out = model(img, augment=augment)  # inference and training outputs
+            # NOTE: few shot start
+            # if few_shot:
+            #     out = model(img, support_features=support_features, augment=augment)
+
+            #     new_out, train_out = [], []
+            #     train_targets = []
+            #     cnt = 0
+            #     cat_ids = []
+            #     n_layers = 3
+            #     for category, (out_cat, train_out_cat) in out.items():
+            #         out_cat = F.pad(out_cat, (0, nc - 1))
+            #         out_cat[:, :, 5 + category] = 1
+            #         if category != 0:
+            #             out_cat[:, :, 5] = 0
+            #         new_out.append(out_cat)
+
+            #         target_cat = targets[targets[:, 1] == category]
+            #         target_cat[:, 1] = 0
+            #         target_cat[:, 0] = target_cat[:, 0] + (cnt * batch_size)
+            #         train_targets.append(target_cat)
+            #         cat_ids.append(category)
+            #         cnt += 1
+
+            #     for i in range(n_layers):
+            #         train_out.append(
+            #             torch.cat([out[cat_id][1][i] for cat_id in cat_ids], dim=0)
+            #         )
+            #     train_targets = torch.cat(train_targets, dim=0)
+            #     out = torch.cat(new_out, dim=1)
+            # else:
+            out, train_out = model(img, support_features=support_features, augment=augment)  # inference and training outputs
+            train_targets = targets
+            # few shot end
+
             t0 += time_synchronized() - t
 
             # Compute loss
             if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+                loss += compute_loss([x.float() for x in train_out], train_targets)[1][:3]  # box, obj, cls
 
             # Run NMS
             targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
@@ -309,6 +371,11 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+
+    # for few shot
+    parser.add_argument('--few-shot', '-fs', action='store_true',
+                        help='if eval the model by few-shot learning')
+    parser.add_argument('--shots', type=int, default=5)
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
@@ -329,8 +396,10 @@ if __name__ == '__main__':
              save_txt=opt.save_txt | opt.save_hybrid,
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
-             trace=not opt.no_trace,
-             v5_metric=opt.v5_metric
+             # trace=not opt.no_trace,
+             v5_metric=opt.v5_metric,
+             few_shot=opt.few_shot,
+             shots=opt.shots
              )
 
     elif opt.task == 'speed':  # speed benchmarks

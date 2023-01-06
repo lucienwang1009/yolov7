@@ -1,11 +1,14 @@
 import argparse
 import logging
 import sys
+import math
 from copy import deepcopy
 
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from models.common import *
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
@@ -90,7 +93,7 @@ class Detect(nn.Module):
         convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
                                            dtype=torch.float32,
                                            device=z.device)
-        box @= convert_matrix                          
+        box @= convert_matrix
         return (box, score)
 
 
@@ -112,7 +115,7 @@ class IDetect(nn.Module):
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
-        
+
         self.ia = nn.ModuleList(ImplicitA(x) for x in ch)
         self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch)
 
@@ -120,37 +123,41 @@ class IDetect(nn.Module):
         # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
+        out = []
         for i in range(self.nl):
-            x[i] = self.m[i](self.ia[i](x[i]))  # conv
-            x[i] = self.im[i](x[i])
-            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            o = self.m[i](self.ia[i](x[i]))  # conv
+            o = self.im[i](o)
+            bs, _, ny, nx = o.shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+            o = o.view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            out.append(o)
 
             if not self.training:  # inference
-                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
-                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+                if self.grid[i].shape[2:4] != o.shape[2:4]:
+                    self.grid[i] = self._make_grid(nx, ny).to(o.device)
 
-                y = x[i].sigmoid()
+                y = o.sigmoid()
                 y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 z.append(y.view(bs, -1, self.no))
 
-        return x if self.training else (torch.cat(z, 1), x)
-    
+        return out if self.training else (torch.cat(z, 1), out)
+
     def fuseforward(self, x):
         # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
+        out = []
         for i in range(self.nl):
-            x[i] = self.m[i](x[i])  # conv
-            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            o = self.m[i](x[i])  # conv
+            bs, _, ny, nx = o.shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+            o = o.view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            out.append(o)
 
             if not self.training:  # inference
-                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
-                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+                if self.grid[i].shape[2:4] != o.shape[2:4]:
+                    self.grid[i] = self._make_grid(nx, ny).to(o.device)
 
-                y = x[i].sigmoid()
+                y = o.sigmoid()
                 if not torch.onnx.is_in_onnx_export():
                     y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                     y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
@@ -162,19 +169,19 @@ class IDetect(nn.Module):
                 z.append(y.view(bs, -1, self.no))
 
         if self.training:
-            out = x
+            pass
         elif self.end2end:
             out = torch.cat(z, 1)
         elif self.include_nms:
             z = self.convert(z)
             out = (z, )
         elif self.concat:
-            out = torch.cat(z, 1)            
+            out = torch.cat(z, 1)
         else:
-            out = (torch.cat(z, 1), x)
+            out = (torch.cat(z, 1), out)
 
         return out
-    
+
     def fuse(self):
         print("IDetect.fuse")
         # fuse ImplicitA and Convolution
@@ -188,7 +195,7 @@ class IDetect(nn.Module):
             c1,c2, _,_ = self.im[i].implicit.shape
             self.m[i].bias *= self.im[i].implicit.reshape(c2)
             self.m[i].weight *= self.im[i].implicit.transpose(0,1)
-            
+
     @staticmethod
     def _make_grid(nx=20, ny=20):
         yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
@@ -203,7 +210,7 @@ class IDetect(nn.Module):
         convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
                                            dtype=torch.float32,
                                            device=z.device)
-        box @= convert_matrix                          
+        box @= convert_matrix
         return (box, score)
 
 
@@ -227,10 +234,10 @@ class IKeypoint(nn.Module):
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no_det * self.na, 1) for x in ch)  # output conv
-        
+
         self.ia = nn.ModuleList(ImplicitA(x) for x in ch)
         self.im = nn.ModuleList(ImplicitM(self.no_det * self.na) for _ in ch)
-        
+
         if self.nkpt is not None:
             if self.dw_conv_kpt: #keypoint head is slightly more complex
                 self.m_kpt = nn.ModuleList(
@@ -327,7 +334,7 @@ class IAuxDetect(nn.Module):
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch[:self.nl])  # output conv
         self.m2 = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch[self.nl:])  # output conv
-        
+
         self.ia = nn.ModuleList(ImplicitA(x) for x in ch[:self.nl])
         self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch[:self.nl])
 
@@ -340,7 +347,7 @@ class IAuxDetect(nn.Module):
             x[i] = self.im[i](x[i])
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
-            
+
             x[i+self.nl] = self.m2[i](x[i+self.nl])
             x[i+self.nl] = x[i+self.nl].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
@@ -392,12 +399,12 @@ class IAuxDetect(nn.Module):
             z = self.convert(z)
             out = (z, )
         elif self.concat:
-            out = torch.cat(z, 1)            
+            out = torch.cat(z, 1)
         else:
             out = (torch.cat(z, 1), x)
 
         return out
-    
+
     def fuse(self):
         print("IAuxDetect.fuse")
         # fuse ImplicitA and Convolution
@@ -426,7 +433,7 @@ class IAuxDetect(nn.Module):
         convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
                                            dtype=torch.float32,
                                            device=z.device)
-        box @= convert_matrix                          
+        box @= convert_matrix
         return (box, score)
 
 
@@ -445,7 +452,7 @@ class IBin(nn.Module):
         self.no = nc + 3 + \
             self.w_bin_sigmoid.get_length() + self.h_bin_sigmoid.get_length()   # w-bce, h-bce
             # + self.x_bin_sigmoid.get_length() + self.y_bin_sigmoid.get_length()
-        
+
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [torch.zeros(1)] * self.nl  # init grid
@@ -453,7 +460,7 @@ class IBin(nn.Module):
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
-        
+
         self.ia = nn.ModuleList(ImplicitA(x) for x in ch)
         self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch)
 
@@ -463,7 +470,7 @@ class IBin(nn.Module):
         #self.y_bin_sigmoid.use_fw_regression = True
         self.w_bin_sigmoid.use_fw_regression = True
         self.h_bin_sigmoid.use_fw_regression = True
-        
+
         # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
@@ -480,7 +487,7 @@ class IBin(nn.Module):
                 y = x[i].sigmoid()
                 y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                 #y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                
+
 
                 #px = (self.x_bin_sigmoid.forward(y[..., 0:12]) + self.grid[i][..., 0]) * self.stride[i]
                 #py = (self.y_bin_sigmoid.forward(y[..., 12:24]) + self.grid[i][..., 1]) * self.stride[i]
@@ -492,9 +499,9 @@ class IBin(nn.Module):
                 #y[..., 1] = py
                 y[..., 2] = pw
                 y[..., 3] = ph
-                
+
                 y = torch.cat((y[..., 0:4], y[..., 46:]), dim=-1)
-                
+
                 z.append(y.view(bs, -1, y.shape[-1]))
 
         return x if self.training else (torch.cat(z, 1), x)
@@ -506,9 +513,11 @@ class IBin(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
+    def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None,
+                 few_shot=False):  # model, input channels, number of classes
         super(Model, self).__init__()
         self.traced = False
+        self.few_shot = few_shot
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
         else:  # is *.yaml
@@ -522,6 +531,13 @@ class Model(nn.Module):
         if nc and nc != self.yaml['nc']:
             logger.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
+
+        # NOTE: few shot
+        if self.few_shot:
+            logger.info(f"Change model.yaml nc={self.yaml['nc']} with nc=1 for few shot learning")
+            self.yaml['nc'] = 1
+            self.nc = nc
+
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
@@ -573,12 +589,32 @@ class Model(nn.Module):
             self._initialize_biases_kpt()  # only run once
             # print('Strides: %s' % m.stride.tolist())
 
+        # NOTE: few shot
+        if self.few_shot:
+            channels = [256, 512, 1024]
+            attention_factor = 4
+            self.qs = nn.ModuleList(
+                nn.Linear(channel, channel // attention_factor, bias=False)
+                for channel in channels
+            )
+            self.ks = nn.ModuleList(
+                nn.Linear(channel, channel // attention_factor, bias=False)
+                for channel in channels
+            )
+            self.fuses = nn.ModuleList(
+                nn.Conv2d(channel * 2, channel, kernel_size=1, bias=False)
+                for channel in channels
+            )
+            # self.detect_for_class = deepcopy(self.model[-1])
+
         # Init weights, biases
         initialize_weights(self)
         self.info()
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False):
+    def forward(self, x,
+                support_imgs=None, support_targets=None, support_features=None,
+                augment=False, profile=False):
         if augment:
             img_size = x.shape[-2:]  # height, width
             s = [1, 0.83, 0.67]  # scales
@@ -596,20 +632,20 @@ class Model(nn.Module):
                 y.append(yi)
             return torch.cat(y, 1), None  # augmented inference, train
         else:
-            return self.forward_once(x, profile)  # single-scale inference, train
+            return self.forward_once(x, support_imgs, support_targets,
+                                     support_features, profile)  # single-scale inference, train
 
-    def forward_once(self, x, profile=False):
+    def backbone_neck(self, x, profile=False):
         y, dt = [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
 
             if not hasattr(self, 'traced'):
-                self.traced=False
+                self.traced = False
 
-            if self.traced:
-                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
-                    break
+            if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
+                break
 
             if profile:
                 c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
@@ -623,12 +659,138 @@ class Model(nn.Module):
                 print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
-            
+
             y.append(x if m.i in self.save else None)  # save output
 
         if profile:
             print('%.1fms total' % sum(dt))
         return x
+
+    def detect(self, x):
+        return self.model[-1](x)
+
+    def forward_once(self, x, support_imgs=None,
+                     support_targets=None, support_features=None,
+                     profile=False):
+        features = self.backbone_neck(x)
+        if self.few_shot and (support_imgs is not None or
+                              support_features is not None):
+            out = list(self.detect(features))
+            if support_features is None:
+                support_features = self.get_support_features(
+                    support_imgs, support_targets
+                )
+            if self.training:
+                for i in range(len(out)):
+                    out[i] = F.pad(out[i], (0, self.nc - 1))
+                    out[i][..., 5:] = -10
+            else:
+                out[0] = F.pad(out[0], (0, self.nc - 1))
+                out[0][..., 5:] = 0
+                for i in range(len(out[1])):
+                    out[1][i] = F.pad(out[1][i], (0, self.nc - 1))
+                    out[1][i][..., 5:] = -10
+
+            # preds: {category: [B, A, H * W, 6] * 3}
+            for cls in support_features[0].keys():
+                fused_features = self.few_shot_feature_fuse(
+                    features, list(layers[cls]
+                                   for layers in support_features)
+                )
+                cls_out = self.detect(fused_features)
+                if self.training:
+                    for i in range(len(out)):
+                        out[i][..., 5 + cls] = cls_out[i][..., 5]
+                else:
+                    out[0][..., 5 + cls] = cls_out[0][..., 5]
+                    for i in range(len(out[1])):
+                        out[1][i][..., 5 + cls] = cls_out[1][i][..., 5]
+        else:
+            out = self.detect(features)
+        # return [out, base_out]
+        return out
+
+    # NOTE: few shot start
+    def get_support_features(self, support_imgs, support_targets):
+        support_features = self.backbone_neck(support_imgs)
+        support_features_pools = []
+        # support_features_keys = []
+        for support_feature_layer in support_features:
+            _, C, H, W = support_feature_layer.shape
+            # support_targets: [n_shots * n_ways, 5]
+            support_features_pool = dict()
+            for support_feature, target in zip(
+                    support_feature_layer, support_targets
+            ):
+                cls, x_center, y_center, width, height = target
+                cls = int(cls.item())
+                if cls not in support_features_pool:
+                    support_features_pool[cls] = []
+
+                left = int(W * (x_center - width / 2))
+                right = int(W * (x_center + width / 2)) + 1
+                top = int(H * (y_center - height / 2))
+                bottom = int(H * (y_center + height / 2)) + 1
+                assert left < right and top < bottom
+                # support_features_pool[cls].append(
+                #     torch.mean(
+                #         support_feature[:, top:bottom, left:right],
+                #         dim=[1, 2], keepdim=True
+                #     )
+                # )
+                support_features_pool[cls].append(
+                    support_feature[:, top:bottom, left:right].unsqueeze(0),
+                )
+            support_features_pools.append(support_features_pool)
+        return support_features_pools
+
+    def few_shot_feature_fuse(self, features, support_features_cls):
+        fused_features = []
+        for layer_idx in range(len(features)):
+            fused_feature = []
+            feature = features[layer_idx]
+            B, C, H, W = feature.size()
+            # query = feature.permute(0, 2, 3, 1).reshape(B, H * W, -1)
+            query = self.qs[layer_idx](
+                feature.permute(0, 2, 3, 1).reshape(B, H * W, -1)
+            )
+            query = query - torch.mean(query, dim=1, keepdim=True)
+
+            for support_feature in support_features_cls[layer_idx]:
+                _, _, s_H, s_W = support_feature.shape
+                # NHWC
+                support_feature_flatten = support_feature.permute(0, 2, 3, 1) \
+                    .reshape(1, s_H * s_W, -1)
+                # key = support_feature_flatten
+                key = self.ks[layer_idx](support_feature_flatten)
+                key = key - torch.mean(key, dim=1, keepdim=True)
+                attention_weight = torch.matmul(
+                    query, key.transpose(1, 2)) / math.sqrt(C)
+                # attention_weight = torch.sigmoid(attention_weight)
+                # mask = torch.ones_like(attention_weight, dtype=attention_weight.dtype,
+                #                        device=attention_weight.device)
+                # mask[attention_weight < 0.505] = 0
+                # attention_weight = attention_weight * mask
+                attention_weight = F.softmax(attention_weight / 1, dim=2)
+                fused_feature.append(
+                    torch.matmul(attention_weight, support_feature_flatten)
+                    .reshape(B, H, W, C).permute(0, 3, 1, 2)
+                )
+            agg_feature = torch.stack(fused_feature, dim=0).mean(dim=0)
+            # concat in the channel dim
+            fused_features.append(
+                # feature * agg_feature
+                # F.cosine_similarity(feature, agg_feature, dim=1).unsqueeze(dim=1)
+                self.fuses[layer_idx](torch.concat(
+                    [agg_feature, feature], dim=1))
+            )
+            # fused_features.append(
+            #     features[layer_idx] *
+            #     support_features_cls[layer_idx].unsqueeze(0)
+            # )
+        return fused_features
+
+    # few shot end
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
@@ -749,14 +911,14 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [nn.Conv2d, Conv, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC, 
-                 SPP, SPPF, SPPCSPC, GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv, 
-                 Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
-                 RepBottleneck, RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,  
-                 Res, ResCSPA, ResCSPB, ResCSPC, 
-                 RepRes, RepResCSPA, RepResCSPB, RepResCSPC, 
-                 ResX, ResXCSPA, ResXCSPB, ResXCSPC, 
-                 RepResX, RepResXCSPA, RepResXCSPB, RepResXCSPC, 
+        if m in [nn.Conv2d, Conv, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC,
+                 SPP, SPPF, SPPCSPC, GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv,
+                 Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC,
+                 RepBottleneck, RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,
+                 Res, ResCSPA, ResCSPB, ResCSPC,
+                 RepRes, RepResCSPA, RepResCSPB, RepResCSPC,
+                 ResX, ResXCSPA, ResXCSPB, ResXCSPC,
+                 RepResX, RepResXCSPA, RepResXCSPB, RepResXCSPC,
                  Ghost, GhostCSPA, GhostCSPB, GhostCSPC,
                  SwinTransformerBlock, STCSPA, STCSPB, STCSPC,
                  SwinTransformer2Block, ST2CSPA, ST2CSPB, ST2CSPC]:
@@ -765,12 +927,12 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
-            if m in [DownC, SPPCSPC, GhostSPPCSPC, 
-                     BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
-                     RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC, 
-                     ResCSPA, ResCSPB, ResCSPC, 
-                     RepResCSPA, RepResCSPB, RepResCSPC, 
-                     ResXCSPA, ResXCSPB, ResXCSPC, 
+            if m in [DownC, SPPCSPC, GhostSPPCSPC,
+                     BottleneckCSPA, BottleneckCSPB, BottleneckCSPC,
+                     RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,
+                     ResCSPA, ResCSPB, ResCSPC,
+                     RepResCSPA, RepResCSPB, RepResCSPC,
+                     ResXCSPA, ResXCSPB, ResXCSPC,
                      RepResXCSPA, RepResXCSPB, RepResXCSPC,
                      GhostCSPA, GhostCSPB, GhostCSPC,
                      STCSPA, STCSPB, STCSPC,
@@ -826,7 +988,7 @@ if __name__ == '__main__':
     # Create model
     model = Model(opt.cfg).to(device)
     model.train()
-    
+
     if opt.profile:
         img = torch.rand(1, 3, 640, 640).to(device)
         y = model(img, profile=True)
