@@ -673,41 +673,24 @@ class Model(nn.Module):
                      support_targets=None, support_features=None,
                      profile=False):
         features = self.backbone_neck(x)
+        base_out = None
         if self.few_shot and (support_imgs is not None or
                               support_features is not None):
-            out = list(self.detect(features))
             if support_features is None:
                 support_features = self.get_support_features(
                     support_imgs, support_targets
                 )
-            if self.training:
-                for i in range(len(out)):
-                    out[i] = F.pad(out[i], (0, self.nc - 1))
-                    out[i][..., 5:] = -10
-            else:
-                out[0] = F.pad(out[0], (0, self.nc - 1))
-                out[0][..., 5:] = 0
-                for i in range(len(out[1])):
-                    out[1][i] = F.pad(out[1][i], (0, self.nc - 1))
-                    out[1][i][..., 5:] = -10
-
-            # preds: {category: [B, A, H * W, 6] * 3}
+            out = dict()
             for cls in support_features[0].keys():
                 fused_features = self.few_shot_feature_fuse(
                     features, list(layers[cls]
                                    for layers in support_features)
                 )
-                cls_out = self.detect(fused_features)
-                if self.training:
-                    for i in range(len(out)):
-                        out[i][..., 5 + cls] = cls_out[i][..., 5]
-                else:
-                    out[0][..., 5 + cls] = cls_out[0][..., 5]
-                    for i in range(len(out[1])):
-                        out[1][i][..., 5 + cls] = cls_out[1][i][..., 5]
+                out[cls] = self.detect(fused_features)
+            if hasattr(self, 'base_detector') and self.base_detector is not None:
+                base_out = self.base_detector(features)
         else:
             out = self.detect(features)
-        # return [out, base_out]
         return out
 
     # NOTE: few shot start

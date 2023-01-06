@@ -99,7 +99,6 @@ def test(data,
         print("Testing with YOLOv5 AP metric...")
 
     # NOTE: few shot start
-    support_features = None
     if few_shot:
         few_shot_generator = FewShotGenerator(
             dataloader.dataset.path, shots=shots
@@ -141,37 +140,37 @@ def test(data,
             # Run model
             t = time_synchronized()
             # NOTE: few shot start
-            # if few_shot:
-            #     out = model(img, support_features=support_features, augment=augment)
+            if few_shot:
+                out = model(img, support_features=support_features, augment=augment)
 
-            #     new_out, train_out = [], []
-            #     train_targets = []
-            #     cnt = 0
-            #     cat_ids = []
-            #     n_layers = 3
-            #     for category, (out_cat, train_out_cat) in out.items():
-            #         out_cat = F.pad(out_cat, (0, nc - 1))
-            #         out_cat[:, :, 5 + category] = 1
-            #         if category != 0:
-            #             out_cat[:, :, 5] = 0
-            #         new_out.append(out_cat)
+                new_out, train_out = [], []
+                train_targets = []
+                cnt = 0
+                cat_ids = []
+                n_layers = 3
+                for category, (out_cat, train_out_cat) in out.items():
+                    out_cat = F.pad(out_cat, (0, nc - 1))
+                    out_cat[:, :, 5 + category] = 1
+                    if category != 0:
+                        out_cat[:, :, 5] = 0
+                    new_out.append(out_cat)
 
-            #         target_cat = targets[targets[:, 1] == category]
-            #         target_cat[:, 1] = 0
-            #         target_cat[:, 0] = target_cat[:, 0] + (cnt * batch_size)
-            #         train_targets.append(target_cat)
-            #         cat_ids.append(category)
-            #         cnt += 1
+                    target_cat = targets[targets[:, 1] == category]
+                    target_cat[:, 1] = 0
+                    target_cat[:, 0] = target_cat[:, 0] + (cnt * batch_size)
+                    train_targets.append(target_cat)
+                    cat_ids.append(category)
+                    cnt += 1
 
-            #     for i in range(n_layers):
-            #         train_out.append(
-            #             torch.cat([out[cat_id][1][i] for cat_id in cat_ids], dim=0)
-            #         )
-            #     train_targets = torch.cat(train_targets, dim=0)
-            #     out = torch.cat(new_out, dim=1)
-            # else:
-            out, train_out = model(img, support_features=support_features, augment=augment)  # inference and training outputs
-            train_targets = targets
+                for i in range(n_layers):
+                    train_out.append(
+                        torch.cat([out[cat_id][1][i] for cat_id in cat_ids], dim=0)
+                    )
+                train_targets = torch.cat(train_targets, dim=0)
+                out = torch.cat(new_out, dim=1)
+            else:
+                out, train_out = model(img, augment=augment)  # inference and training outputs
+                train_targets = targets
             # few shot end
 
             t0 += time_synchronized() - t
@@ -189,6 +188,7 @@ def test(data,
 
         # Statistics per image
         for si, pred in enumerate(out):
+            print(pred)
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class

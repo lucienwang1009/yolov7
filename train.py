@@ -372,6 +372,37 @@ def train(hyp, opt, device, tb_writer=None):
             with amp.autocast(enabled=cuda):
                 pred = model(imgs, support_imgs, support_targets)  # forward
 
+                # NOTE: few shot start
+                if opt.few_shot:
+                    # preds: {category: [B, A, H * W, 6] * 3}
+                    # targets: [[img_id, category, x_center, y_center, width, height]]
+                    targets_out = []
+                    cnt = 0
+                    cat_ids = []
+                    n_layers = 3
+                    for category_id, pred_cats in pred.items():
+                        # for idx in range(len(pred_cats)):
+                        #     pred_cats[idx] = F.pad(pred_cats[idx], pad=(0, nc - 1))
+                        #     pred_cats[idx][:, :, :, category_id] = pred_cats[idx][:, :, :, 5]
+                        #     if category_id != 0:
+                        #         pred_cats[idx][:, :, :, 0] = 0
+                        target_cat = targets[targets[:, 1] == category_id]
+                        target_cat[:, 1] = 0
+                        target_cat[:, 0] = target_cat[:, 0] + (cnt * batch_size)
+                        targets_out.append(target_cat)
+                        cat_ids.append(category_id)
+                        cnt += 1
+
+                    preds_out = []
+                    for i in range(n_layers):
+                        preds_out.append(
+                            torch.cat([pred[cat_id][i] for cat_id in cat_ids], dim=0)
+                        )
+                    targets_out = torch.cat(targets_out, dim=0)
+                    pred = preds_out
+                    targets = targets_out
+                    # few shot end
+
                 if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
                     loss, loss_items = compute_loss_ota(pred, targets, imgs)  # loss scaled by batch_size
                 else:
