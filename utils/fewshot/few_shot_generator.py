@@ -36,9 +36,11 @@ class FewShotGenerator(object):
             cls = []
 
         if self.ways is not None:
+            random.shuffle(cls)
             complement_cats = list(self.categories.difference(cls))
             random.shuffle(complement_cats)
             cls += complement_cats[:max(self.ways - len(cls), 0)]
+            # cls = cls[:self.ways]
         else:
             cls = list(self.categories)
 

@@ -285,7 +285,8 @@ def train(hyp, opt, device, tb_writer=None):
     hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
     hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
     hyp['label_smoothing'] = opt.label_smoothing
-    model.nc = nc  # attach number of classes to model
+    # NOTE: fewshot
+    model.nc = 1 if opt.few_shot else nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
     model.gr = 1.0  # iou loss ratio (obj_loss = 1.0 or iou)
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
@@ -376,30 +377,44 @@ def train(hyp, opt, device, tb_writer=None):
                 if opt.few_shot:
                     # preds: {category: [B, A, H * W, 6] * 3}
                     # targets: [[img_id, category, x_center, y_center, width, height]]
-                    targets_out = []
+                    n_cats = len(pred)
                     cnt = 0
                     cat_ids = []
                     n_layers = 3
-                    for category_id, pred_cats in pred.items():
-                        # for idx in range(len(pred_cats)):
-                        #     pred_cats[idx] = F.pad(pred_cats[idx], pad=(0, nc - 1))
-                        #     pred_cats[idx][:, :, :, category_id] = pred_cats[idx][:, :, :, 5]
-                        #     if category_id != 0:
-                        #         pred_cats[idx][:, :, :, 0] = 0
+                    cls_preds = [[] for _ in range(n_layers)]
+                    preds_per_layer = [[] for _ in range(n_layers)]
+                    targets_out = []
+                    for idx, (category_id, pred_cats) in enumerate(pred.items()):
+                        for layer_idx, pred_layer in enumerate(pred_cats):
+                            isnan = torch.isnan(pred_layer)
+                            if isnan.any():
+                                print(isnan.nonzero())
+                                raise RuntimeError('Predication contains nan!')
+
+                            cls_preds[layer_idx].append(pred_layer[..., 5:])
+                            preds_per_layer[layer_idx].append(pred_layer[..., :5])
                         target_cat = targets[targets[:, 1] == category_id]
-                        target_cat[:, 1] = 0
+                        target_cat[:, 1] = idx
                         target_cat[:, 0] = target_cat[:, 0] + (cnt * batch_size)
                         targets_out.append(target_cat)
                         cat_ids.append(category_id)
                         cnt += 1
 
-                    preds_out = []
-                    for i in range(n_layers):
-                        preds_out.append(
-                            torch.cat([pred[cat_id][i] for cat_id in cat_ids], dim=0)
+                    for layer_idx in range(n_layers):
+                        preds_per_layer[layer_idx] = torch.cat(
+                            preds_per_layer[layer_idx], dim=0
+                        )
+                        cls_preds[layer_idx] = torch.cat(
+                            cls_preds[layer_idx], dim=-1
+                        ).repeat(n_cats, 1, 1, 1, 1)
+                        preds_per_layer[layer_idx] = torch.cat(
+                            (
+                                preds_per_layer[layer_idx],
+                                cls_preds[layer_idx]
+                            ), dim=-1
                         )
                     targets_out = torch.cat(targets_out, dim=0)
-                    pred = preds_out
+                    pred = preds_per_layer
                     targets = targets_out
                     # few shot end
 
@@ -411,7 +426,6 @@ def train(hyp, opt, device, tb_writer=None):
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss *= 4.
-
             # Backward
             scaler.scale(loss).backward()
 
@@ -466,7 +480,7 @@ def train(hyp, opt, device, tb_writer=None):
                                                  verbose=nc < 50 and final_epoch,
                                                  plots=plots and final_epoch,
                                                  wandb_logger=wandb_logger,
-                                                 compute_loss=compute_loss,
+                                                 compute_loss=None,  # compute_loss,
                                                  is_coco=is_coco,
                                                  v5_metric=opt.v5_metric,
                                                  few_shot=opt.few_shot,

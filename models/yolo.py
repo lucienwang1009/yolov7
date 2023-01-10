@@ -536,7 +536,6 @@ class Model(nn.Module):
         if self.few_shot:
             logger.info(f"Change model.yaml nc={self.yaml['nc']} with nc=1 for few shot learning")
             self.yaml['nc'] = 1
-            self.nc = nc
 
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
@@ -553,7 +552,8 @@ class Model(nn.Module):
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
-            self._initialize_biases()  # only run once
+            # NOTE: fewshot
+            # self._initialize_biases()  # only run once
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IDetect):
             s = 256  # 2x min stride
@@ -561,7 +561,7 @@ class Model(nn.Module):
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
-            self._initialize_biases()  # only run once
+            # self._initialize_biases()  # only run once
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IAuxDetect):
             s = 256  # 2x min stride

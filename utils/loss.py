@@ -455,6 +455,7 @@ class ComputeLoss:
         device = targets.device
         lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        nc = p[0].shape[-1] - 5
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
@@ -476,7 +477,7 @@ class ComputeLoss:
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
 
                 # Classification
-                if self.nc > 1:  # cls loss (only if multiple classes)
+                if nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
                     t[range(n), tcls[i]] = self.cp
                     #t[t==self.cp] = iou.detach().clamp(0).type(t.dtype)
@@ -593,6 +594,8 @@ class ComputeLossOTA:
         # print(targets)
         pre_gen_gains = [torch.tensor(pp.shape, device=device)[[3, 2, 3, 2]] for pp in p]
 
+        nc = p[0].shape[-1] - 5
+
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
@@ -606,7 +609,7 @@ class ComputeLossOTA:
                 # Regression
                 grid = torch.stack([gi, gj], dim=1)
                 pxy = ps[:, :2].sigmoid() * 2. - 0.5
-                #pxy = ps[:, :2].sigmoid() * 3. - 1.
+                # pxy = ps[:, :2].sigmoid() * 3. - 1.
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
@@ -621,7 +624,7 @@ class ComputeLossOTA:
 
                 # Classification
                 selected_tcls = targets[i][:, 1].long()
-                if self.nc > 1:  # cls loss (only if multiple classes)
+                if nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
                     t[range(n), selected_tcls] = self.cp
                     lcls += self.BCEcls(ps[:, 5:], t)  # BCE
@@ -663,6 +666,7 @@ class ComputeLossOTA:
         matching_anchs = [[] for pp in p]
 
         nl = len(p)
+        nc = p[0].shape[-1] - 5
 
         for batch_idx in range(p[0].shape[0]):
 
@@ -671,7 +675,8 @@ class ComputeLossOTA:
             if this_target.shape[0] == 0:
                 continue
 
-            txywh = this_target[:, 2:6] * imgs[batch_idx].shape[1]
+            # NOTE: change the size of images
+            txywh = this_target[:, 2:6] * imgs[0].shape[1]
             txyxy = xywh2xyxy(txywh)
 
             pxyxys = []
@@ -728,7 +733,7 @@ class ComputeLossOTA:
             dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
 
             gt_cls_per_image = (
-                F.one_hot(this_target[:, 1].to(torch.int64), self.nc)
+                F.one_hot(this_target[:, 1].to(torch.int64), nc)
                 .float()
                 .unsqueeze(1)
                 .repeat(1, pxyxys.shape[0], 1)

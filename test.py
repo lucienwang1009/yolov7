@@ -110,8 +110,7 @@ def test(data,
         )
         if half:
             support_imgs = support_imgs.half()
-        else:
-            support_imgs = support_imgs.float() / 255
+        support_imgs /= 255
         support_targets = torch.stack(support_targets, 0).to(device)
 
         support_features = model.get_support_features(
@@ -143,36 +142,53 @@ def test(data,
             if few_shot:
                 out = model(img, support_features=support_features, augment=augment)
 
-                new_out, train_out = [], []
-                train_targets = []
-                cnt = 0
-                cat_ids = []
-                n_layers = 3
-                for category, (out_cat, train_out_cat) in out.items():
-                    out_cat = F.pad(out_cat, (0, nc - 1))
-                    out_cat[:, :, 5 + category] = 1
-                    if category != 0:
-                        out_cat[:, :, 5] = 0
-                    new_out.append(out_cat)
+                if False:
+                    cls_preds = None
+                    obj_conf = None
+                    for category_id, (pred_cat, train_out_cat) in out.items():
+                        isnan = torch.isnan(pred_cat)
+                        if isnan.any():
+                            print(isnan.nonzero())
+                            raise RuntimeError('Predication contains nan!')
 
-                    target_cat = targets[targets[:, 1] == category]
-                    target_cat[:, 1] = 0
-                    target_cat[:, 0] = target_cat[:, 0] + (cnt * batch_size)
-                    train_targets.append(target_cat)
-                    cat_ids.append(category)
-                    cnt += 1
+                        if cls_preds is None:
+                            N, O, _ = pred_cat.size()
+                            cls_preds = torch.zeros((N, O, nc),
+                                                    dtype=pred_cat.dtype,
+                                                    device=pred_cat.device)
+                            obj_conf = torch.zeros((N, O, nc),
+                                                   dtype=pred_cat.dtype,
+                                                   device=pred_cat.device)
+                            cls_preds[..., category_id] = pred_cat[..., 5]
+                            obj_conf[..., category_id] = pred_cat[..., 4]
+                        else:
+                            cls_preds[..., category_id] = pred_cat[..., 5]
+                            obj_conf[..., category_id] = pred_cat[..., 4]
 
-                for i in range(n_layers):
-                    train_out.append(
-                        torch.cat([out[cat_id][1][i] for cat_id in cat_ids], dim=0)
-                    )
-                train_targets = torch.cat(train_targets, dim=0)
-                out = torch.cat(new_out, dim=1)
+                    conf_score = cls_preds.softmax(dim=-1) * obj_conf.sigmoid()
+                    cls_selector = conf_score.argmax(dim=-1, keepdim=True)
+                    cls_selector = cls_selector.repeat(1, 1, 5).unsqueeze(2)
+                    preds_out = torch.stack([out[cat][0]
+                                             for cat in range(nc)], dim=2)
+                    preds_out = preds_out[..., :5].gather(2, cls_selector).squeeze(2)
+                    preds_out = torch.cat((preds_out, cls_preds), dim=-1)
+                    out = preds_out
+                else:
+                    new_out = []
+                    for category_id, (pred_cat, train_out_cat) in out.items():
+                        p = F.pad(pred_cat, (0, nc - 1))
+                        p[..., 5 + category_id] = p[..., 5]
+                        if category_id != 0:
+                            p[..., 5] = 0
+                        new_out.append(p)
+                    out = torch.cat(new_out, dim=1)
+
+                train_out = None
             else:
                 out, train_out = model(img, augment=augment)  # inference and training outputs
                 train_targets = targets
-            # few shot end
 
+            # few shot end
             t0 += time_synchronized() - t
 
             # Compute loss
@@ -188,7 +204,6 @@ def test(data,
 
         # Statistics per image
         for si, pred in enumerate(out):
-            print(pred)
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
             tcls = labels[:, 0].tolist() if nl else []  # target class
